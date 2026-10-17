@@ -467,10 +467,10 @@ function saveLocal(){ try { localStorage.setItem(LS, JSON.stringify(store.days))
 let db = null, sync = "local";
 const ver = {}, timers = {}, chains = {}, dirty = new Set();
 function setSync(s){ sync = s; const el = document.getElementById("sync"); if (el){ el.dataset.s = s; el.lastChild.textContent = syncText(); } }
-function syncText(){ return sync === "synced" ? "Synced" : sync === "saving" ? "Saving…" : sync === "error" ? "Not synced, saved on this phone" : "Saved on this phone"; }
+function syncText(){ if (!ghToken) return "Saved on this phone"; return ghState === "synced" ? "Synced for Claude" : ghState === "saving" ? "Syncing…" : ghState === "error" ? "Saved on phone · sync failed" : "Saved on this phone"; }
 
 function touch(s){
-  const d = store.days[s]; d.updatedAt = Date.now(); saveLocal();
+  const d = store.days[s]; d.updatedAt = Date.now(); saveLocal(); ghSchedule();
   ver[s] = (ver[s]||0) + 1;
   if (db){ dirty.add(s); clearTimeout(timers[s]); timers[s] = setTimeout(() => flush(s), 600); setSync("saving"); }
 }
@@ -549,7 +549,7 @@ let pending = false;
 
 function header(kicker, title, sub){
   return `<header class="stack">
-    <div class="topline"><span class="eyebrow">${kicker}</span><span class="sync" id="sync" data-s="${sync}"><i></i>${esc(syncText())}</span></div>
+    <div class="topline"><span class="eyebrow">${kicker}</span><span class="sync" id="sync" data-s="${ghToken ? ghState : "local"}"><i></i>${esc(syncText())}</span></div>
     <h1>${title}</h1>${sub ? `<p class="muted">${sub}</p>` : ""}
   </header>`;
 }
@@ -560,7 +560,7 @@ function viewToday(){
   const kicker = TODAY < START ? "Starts tomorrow" : TODAY > END ? "Program complete" : `Week ${w} of 7 · ${ph.name}`;
   const sub = left > 0 ? `<span class="num">${left}</span> days to Sunday, Dec 6` : left === 0 ? "Today is the day. Take your final photos." : "Phase one is done. Keep logging; a new block comes next.";
   const isCheck = parse(TODAY).getDay() === 5;
-  const stepT = WK.steps[w];
+  const stepT = stepsFor(w);
   const checks = [
     ["Workout", key === "rest" ? (d.steps >= stepT) : !!d.done, key === "rest" ? "Walk" : "Workout"],
     ["Protein", t.p >= T.p - 10, `Protein ${t.p}/${T.p} g`],
@@ -598,7 +598,7 @@ function viewToday(){
     </section>`;
   }
   const tip = TIPS[((diff(TODAY, KICKOFF) % TIPS.length) + TIPS.length) % TIPS.length];
-  return header(kicker, esc(fmtLong(TODAY)), sub) + installCard() + pre + sessionCard + `
+  return header(kicker, esc(fmtLong(TODAY)), sub) + installCard() + pre + sessionCard + coachCard() + `
   <section class="card">
     <div class="spread"><h2>Today's numbers</h2></div>
     <div class="grid3">
@@ -627,7 +627,7 @@ function viewWorkout(){
   const kickBtn = false ? `<button type="button" data-act="session" data-k="kickoff" aria-pressed="${key === "kickoff"}" style="--c:var(--grey)"><span class="sw"></span>Kickoff</button>` : "";
   let body = "";
   if (key === "rest"){
-    body = `<section class="card"><div class="session"><div class="plate p-grey" aria-hidden="true"></div><div class="meta"><h2>Rest day</h2><span class="muted small">No gym. Walk ${fmtN(WK.steps[w])}+ steps and recover.</span></div></div>
+    body = `<section class="card"><div class="session"><div class="plate p-grey" aria-hidden="true"></div><div class="meta"><h2>Rest day</h2><span class="muted small">No gym. Walk ${fmtN(stepsFor(w))}+ steps and recover.</span></div></div>
       <p>Rest days are when your muscles rebuild. Training 7 days a week as a beginner makes you weaker, not faster. If you want to move, take a long walk or a hike.</p></section>`;
   } else {
     const items = s.items.slice();
@@ -825,7 +825,8 @@ function viewProgress(){
     <p class="small muted">Everything you log stays on this phone. Save a backup every week or so. You can also send the file to Claude for a progress review.</p>
     <div class="row"><button class="btn" type="button" data-act="export">Save backup</button><label class="btn" for="import-file" style="color:var(--ink);font-size:1rem;flex-direction:row">Restore backup<input id="import-file" type="file" accept="application/json,.json" hidden></label></div>
     <p class="small" id="backup-msg"></p>
-  </section>`;
+  </section>
+  <section class="card" id="sync-card">${syncCard()}</section>`;
 }
 
 function viewPlan(){
@@ -895,6 +896,107 @@ function viewPlan(){
   </section>`;
 }
 
+/* ---------- nightly check: sync to a private GitHub repo ---------- */
+const GH = { owner:"JelaleddinG", repo:"rbe3002-data", path:"data/days.json", coach:"coach/latest.json" };
+let ghToken = null, ghSha = null, ghTimer = null, ghBusy = false, ghDirty = false, ghState = "off", ghMsg = "", coach = null, lastPull = 0;
+try { ghToken = localStorage.getItem("lbd-gh-token"); } catch(e){}
+try { coach = JSON.parse(localStorage.getItem("lbd-coach") || "null"); } catch(e){ coach = null; }
+const b64e = str => { const by = new TextEncoder().encode(str); let bin = ""; for (let i = 0; i < by.length; i += 8192) bin += String.fromCharCode.apply(null, by.subarray(i, i + 8192)); return btoa(bin); };
+const b64d = b64 => new TextDecoder().decode(Uint8Array.from(atob(String(b64).replace(/\s/g, "")), c => c.charCodeAt(0)));
+function setGh(st, msg){
+  ghState = st; if (msg != null) ghMsg = msg;
+  const el = document.getElementById("sync"); if (el){ el.dataset.s = ghToken ? st : "local"; el.lastChild.textContent = syncText(); }
+  const p = document.getElementById("gh-msg"); if (p) p.textContent = ghMsg;
+}
+function ghFetch(path, opts){
+  opts = opts || {};
+  return fetch(`https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${path}`, { method:opts.method || "GET", cache:"no-store", body:opts.body,
+    headers:{ "Authorization":"Bearer " + ghToken, "Accept":"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28", "Content-Type":"application/json" } });
+}
+async function ghGet(path){ const r = await ghFetch(path); if (r.status === 404) return null; if (!r.ok) throw { status:r.status }; const j = await r.json(); return { sha:j.sha, text:b64d(j.content || "") }; }
+function applyCoach(){
+  const t = (coach && coach.targets) || {};
+  T.kcal = (isNum(t.kcal) && t.kcal >= 1600 && t.kcal <= 2600) ? Math.round(t.kcal) : 2000;
+}
+function stepsFor(w){ const t = coach && coach.targets; return (t && isNum(t.steps) && t.steps >= 5000 && t.steps <= 20000) ? Math.round(t.steps) : WK.steps[w]; }
+async function ghPull(){
+  if (!ghToken) return;
+  lastPull = Date.now();
+  try {
+    const f = await ghGet(GH.path);
+    if (f){
+      ghSha = f.sha;
+      let days = {}; try { days = (JSON.parse(f.text) || {}).days || {}; } catch(e){}
+      for (const [k, v] of Object.entries(days)){
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(k) || !v || typeof v !== "object") continue;
+        const cur = store.days[k];
+        if (!cur || (v.updatedAt || 0) > (cur.updatedAt || 0)) store.days[k] = v;
+        else if ((cur.updatedAt || 0) > (v.updatedAt || 0)) ghDirty = true;
+      }
+      for (const k of Object.keys(store.days)) if (!days[k]) ghDirty = true;
+      saveLocal();
+    } else if (Object.keys(store.days).length) ghDirty = true;
+    const c = await ghGet(GH.coach);
+    if (c){ try { coach = JSON.parse(c.text); localStorage.setItem("lbd-coach", JSON.stringify(coach)); } catch(e){} }
+    applyCoach(); setGh("synced"); render();
+    if (ghDirty) ghSchedule(400);
+  } catch(e){ setGh("error", e && (e.status === 401 || e.status === 403) ? "GitHub rejected the token. Reconnect below." : "Couldn't reach GitHub. Trying again later."); }
+}
+function ghSchedule(ms){ if (!ghToken) return; ghDirty = true; clearTimeout(ghTimer); ghTimer = setTimeout(ghPush, ms == null ? 4000 : ms); }
+async function ghPush(){
+  if (!ghToken || ghBusy || !ghDirty) return;
+  ghBusy = true; ghDirty = false; setGh("saving");
+  const body = JSON.stringify({ app:"lean-by-december", version:1, savedAt:new Date().toISOString(), days:store.days });
+  try {
+    for (let attempt = 0; attempt < 2; attempt++){
+      const payload = { message:"log " + TODAY, content:b64e(body) }; if (ghSha) payload.sha = ghSha;
+      const r = await ghFetch(GH.path, { method:"PUT", body:JSON.stringify(payload) });
+      if (r.ok){ const j = await r.json(); ghSha = j.content && j.content.sha; setGh("synced", "Last synced " + new Date().toLocaleTimeString("en-US", { hour:"numeric", minute:"2-digit" }) + "."); break; }
+      if ((r.status === 409 || r.status === 422) && attempt === 0){ const f = await ghGet(GH.path); ghSha = f ? f.sha : null; continue; }
+      throw { status:r.status };
+    }
+  } catch(e){ ghDirty = true; setGh("error", e && (e.status === 401 || e.status === 403) ? "GitHub rejected the token. Reconnect below." : "Couldn't sync. Trying again shortly."); }
+  ghBusy = false;
+  if (ghDirty) { clearTimeout(ghTimer); ghTimer = setTimeout(ghPush, 20000); }
+}
+async function ghConnect(){
+  const el = document.getElementById("gh-token"), t = ((el && el.value) || "").trim();
+  const say = m => { ghMsg = m; const p = document.getElementById("gh-msg"); if (p) p.textContent = m; };
+  if (!t){ say("Paste the token first."); return; }
+  say("Checking…");
+  try {
+    const r = await fetch(`https://api.github.com/repos/${GH.owner}/${GH.repo}`, { cache:"no-store", headers:{ "Authorization":"Bearer " + t, "Accept":"application/vnd.github+json" } });
+    if (!r.ok){ say(r.status === 401 ? "GitHub didn't accept that token. Copy it again." : r.status === 404 ? "That token can't see rbe3002-data. Give it access to that repo." : "GitHub said no (" + r.status + "). Try again."); return; }
+    const j = await r.json(); if (j.permissions && j.permissions.push === false){ say("That token can read but not write. Set Contents to Read and write."); return; }
+  } catch(e){ say("Couldn't reach GitHub. Check your connection."); return; }
+  ghToken = t; try { localStorage.setItem("lbd-gh-token", t); } catch(e){}
+  ghMsg = "Connected. Claude checks in around 11:30 pm."; ghDirty = true;
+  await ghPull(); ghSchedule(300); render(true);
+}
+function syncCard(){
+  if (ghToken) return `<h2>Nightly check by Claude</h2>
+    <p class="small">Connected. Your log syncs to your private <b>rbe3002-data</b> repo, and Claude reviews it every night around 11:30 pm. Its note shows on the Today tab.</p>
+    <div class="row"><button class="btn" type="button" data-act="gh-sync">Sync now</button><button class="btn" type="button" data-act="gh-off">Disconnect</button></div>
+    <p class="small muted" id="gh-msg">${esc(ghMsg)}</p>`;
+  return `<h2>Nightly check by Claude</h2>
+    <p class="small">Connect once and Claude reviews your log every night around 11:30 pm, then leaves a note on the Today tab.</p>
+    <ol class="small" style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:4px">
+      <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub: new fine-grained token</a> and sign in.</li>
+      <li>Name it "lean app", expiration 90 days. Repository access: <b>Only select repositories</b>, pick <b>rbe3002-data</b>.</li>
+      <li>Permissions, Repository: set <b>Contents</b> to <b>Read and write</b>. Generate, then copy the token.</li>
+      <li>Paste it here and tap Connect. It stays on this phone.</li>
+    </ol>
+    <label for="gh-token">Token<input id="gh-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…"></label>
+    <button class="btn primary" type="button" data-act="gh-connect">Connect</button>
+    <p class="small muted" id="gh-msg">${esc(ghMsg)}</p>`;
+}
+function coachCard(){
+  if (!coach || !coach.note) return "";
+  const dt = typeof coach.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(coach.date) ? " · " + fmtShort(coach.date) : "";
+  const bl = Array.isArray(coach.bullets) ? coach.bullets.slice(0, 5).filter(b => typeof b === "string" && b.trim()) : [];
+  return `<section class="card"><span class="eyebrow">Claude's check-in${esc(dt)}</span><p>${esc(String(coach.note).slice(0, 600))}</p>${bl.length ? `<ul class="stack" style="margin:0;padding-left:20px">${bl.map(b => `<li>${esc(b.slice(0, 200))}</li>`).join("")}</ul>` : ""}</section>`;
+}
+
 function installCard(){
   let standalone = false, hidden = false;
   try { standalone = window.navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches; } catch(e){}
@@ -929,7 +1031,7 @@ function importFile(f){
         const cur = store.days[k];
         if (!cur || (v.updatedAt || 0) >= (cur.updatedAt || 0)){ store.days[k] = v; n++; }
       }
-      saveLocal(); render(true); say(`Restored ${n} day${n === 1 ? "" : "s"}.`);
+      saveLocal(); ghSchedule(); render(true); say(`Restored ${n} day${n === 1 ? "" : "s"}.`);
     } catch(e){ say("That file isn't a Lean by December backup."); }
   };
   rd.readAsText(f);
@@ -993,6 +1095,9 @@ main.addEventListener("click", e => {
   }
   if (act === "estimate"){ estimate(); return; }
   if (act === "export"){ exportData(); return; }
+  if (act === "gh-connect"){ ghConnect(); return; }
+  if (act === "gh-sync"){ ghDirty = true; ghPull().then(() => ghPush()); return; }
+  if (act === "gh-off"){ ghToken = null; ghSha = null; ghMsg = ""; try { localStorage.removeItem("lbd-gh-token"); } catch(e){} setGh("off"); render(true); return; }
   if (act === "hide-install"){ try { localStorage.setItem("lbd-install-hide", "1"); } catch(e){} render(true); return; }
   if (act === "ai-cancel"){ ai = { st:"idle" }; paintAI(); return; }
   if (act === "ai-add"){
@@ -1019,12 +1124,14 @@ document.getElementById("rest-plus").addEventListener("click", () => { restEnd =
 document.getElementById("rest-skip").addEventListener("click", () => { clearInterval(restTimer); restTimer = null; restEl.hidden = true; });
 
 /* ---------- boot ---------- */
-document.addEventListener("visibilitychange", () => { if (!document.hidden){ const n = ymd(new Date()); if (n !== TODAY){ TODAY = n; render(); } } });
+document.addEventListener("visibilitychange", () => { if (document.hidden){ if (ghDirty) ghPush(); return; } const n = ymd(new Date()); if (n !== TODAY){ TODAY = n; render(); } if (ghToken && Date.now() - lastPull > 5 * 60 * 1000) ghPull(); });
 try { const h = location.hash.slice(1); if (VIEWS[h]) tab = h; else { const t = localStorage.getItem("lbd-tab"); if (t && VIEWS[t]) tab = t; } } catch(e){}
 loadLocal();
+applyCoach();
 render(true);
+if (ghToken) ghPull();
 if (window.ANIM) window.ANIM.start();
-if ("serviceWorker" in navigator) window.addEventListener("load", () => { navigator.serviceWorker.register("sw.js").catch(() => {}); });
+if ("serviceWorker" in navigator){ const hadCtl = !!navigator.serviceWorker.controller; let reloaded = false; navigator.serviceWorker.addEventListener("controllerchange", () => { if (hadCtl && !reloaded){ reloaded = true; location.reload(); } }); window.addEventListener("load", () => { navigator.serviceWorker.register("sw.js").catch(() => {}); }); }
 })();
 </script>
 </body>
