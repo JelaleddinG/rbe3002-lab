@@ -544,6 +544,7 @@ const demo = ex => "https://www.youtube.com/results?search_query=" + encodeURICo
 
 /* ---------- views ---------- */
 let tab = "today";
+let viewSess = null;   // session being previewed on the Workout tab; saved only when you log in it
 const openEx = new Set();
 let pending = false;
 
@@ -622,7 +623,8 @@ function meters(t){
 }
 
 function viewWorkout(){
-  const d = day(TODAY), w = weekOf(TODAY), ph = phase(w), key = sessionFor(TODAY), s = S[key];
+  const d = day(TODAY), w = weekOf(TODAY), ph = phase(w), planned = sessionFor(TODAY), key = viewSess || planned, s = S[key];
+  const preview = key !== planned ? `<p class="note small">Previewing <b>${esc(s.name)}</b>. Today's workout is still ${esc(S[planned].name)}. Log a set here to switch today to ${esc(s.name)}.</p>` : "";
   const sw = ORDER.map(k => `<button type="button" data-act="session" data-k="${k}" aria-pressed="${k === key}" style="--c:var(--${S[k].plate})"><span class="sw"></span>${esc(S[k].name)}</button>`).join("");
   const kickBtn = false ? `<button type="button" data-act="session" data-k="kickoff" aria-pressed="${key === "kickoff"}" style="--c:var(--grey)"><span class="sw"></span>Kickoff</button>` : "";
   let body = "";
@@ -641,7 +643,7 @@ function viewWorkout(){
     <button class="btn ${d.done ? "" : "primary"} block" type="button" data-act="finish">${d.done ? "Marked done · tap to undo" : "Finish workout"}</button>`;
   }
   return header("Workout", esc(s.name), esc(fmtLong(TODAY))) +
-    `<div class="switch" role="group" aria-label="Choose session">${kickBtn}${sw}</div>` + body;
+    `<div class="switch" role="group" aria-label="Choose session">${kickBtn}${sw}</div>` + preview + body;
 }
 
 function exCard(item, w, d){
@@ -1047,7 +1049,7 @@ function render(force){
   document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-current", b.dataset.tab === tab ? "page" : "false"));
 }
 document.addEventListener("focusout", () => setTimeout(() => { if (pending && !typing()) render(); }, 60));
-function go(t){ tab = t; try { localStorage.setItem("lbd-tab", t); } catch(e){} render(true); window.scrollTo(0,0); }
+function go(t){ if (t !== "workout") viewSess = null; tab = t; try { localStorage.setItem("lbd-tab", t); } catch(e){} render(true); window.scrollTo(0,0); }
 
 /* ---------- events ---------- */
 document.querySelector("nav.tabs").addEventListener("click", e => { const b = e.target.closest("button[data-tab]"); if (b) go(b.dataset.tab); });
@@ -1057,6 +1059,7 @@ main.addEventListener("change", e => {
   const raw = el.value.trim(), n = raw === "" ? null : Number(raw), v = isNum(n) ? n : null;
   const d = day(TODAY, true);
   if (f === "set"){
+    commitView(d);
     const k = el.dataset.k, i = +el.dataset.i, j = +el.dataset.j;
     d.sets = d.sets || {}; const arr = d.sets[k] = d.sets[k] || [];
     while (arr.length <= i) arr.push(null);
@@ -1068,11 +1071,15 @@ main.addEventListener("change", e => {
     if (tab === "today") pending = true;
   }
 });
+function commitView(d){
+  if (tab === "workout" && viewSess && viewSess !== sessionFor(TODAY)){ d.session = viewSess === defaultSession(TODAY) ? null : viewSess; viewSess = null; }
+}
 main.addEventListener("click", e => {
   const b = e.target.closest("[data-act]"); if (!b) return;
   const act = b.dataset.act, d = day(TODAY, true);
-  if (act === "go-workout"){ go("workout"); return; }
-  if (act === "session"){ d.session = b.dataset.k === defaultSession(TODAY) ? null : b.dataset.k; touch(TODAY); render(true); return; }
+  if (act === "tick" || act === "finish") commitView(d);
+  if (act === "go-workout"){ viewSess = null; go("workout"); return; }
+  if (act === "session"){ viewSess = b.dataset.k === sessionFor(TODAY) ? null : b.dataset.k; render(true); return; }
   if (act === "how"){ const k = b.dataset.k; openEx.has(k) ? openEx.delete(k) : openEx.add(k); render(true); return; }
   if (act === "tick"){
     const k = b.dataset.k, i = +b.dataset.i;
@@ -1124,7 +1131,7 @@ document.getElementById("rest-plus").addEventListener("click", () => { restEnd =
 document.getElementById("rest-skip").addEventListener("click", () => { clearInterval(restTimer); restTimer = null; restEl.hidden = true; });
 
 /* ---------- boot ---------- */
-document.addEventListener("visibilitychange", () => { if (document.hidden){ if (ghDirty) ghPush(); return; } const n = ymd(new Date()); if (n !== TODAY){ TODAY = n; render(); } if (ghToken && Date.now() - lastPull > 5 * 60 * 1000) ghPull(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden){ if (ghDirty) ghPush(); return; } const n = ymd(new Date()); if (n !== TODAY){ TODAY = n; viewSess = null; render(); } if (ghToken && Date.now() - lastPull > 5 * 60 * 1000) ghPull(); });
 try { const h = location.hash.slice(1); if (VIEWS[h]) tab = h; else { const t = localStorage.getItem("lbd-tab"); if (t && VIEWS[t]) tab = t; } } catch(e){}
 loadLocal();
 applyCoach();
